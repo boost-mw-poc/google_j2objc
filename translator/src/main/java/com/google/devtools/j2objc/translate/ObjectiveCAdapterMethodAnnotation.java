@@ -63,6 +63,8 @@ import org.jspecify.annotations.Nullable;
 
 /** Implements the ObjectiveCAdapterMethod annotation. */
 public class ObjectiveCAdapterMethodAnnotation extends UnitTreeVisitor {
+  
+  private final List<String> adapterMethodSelectors = new ArrayList<>();
 
   public ObjectiveCAdapterMethodAnnotation(CompilationUnit unit) {
     super(unit);
@@ -101,6 +103,16 @@ public class ObjectiveCAdapterMethodAnnotation extends UnitTreeVisitor {
       }
       return selector;
     }
+    // Support the Kotlin/Swift Throws annotation:
+    // https://github.com/kotlin-hands-on/kotlin-swift-interopedia/blob/main/docs/overview/Exceptions.md
+    // Source:
+    // https://github.com/google/xplat/blob/main/j2kt/annotations/java/com/google/j2kt/annotations/Throws.java
+    if (ElementUtil.getQualifiedNamedAnnotation(
+            methodExecutable, "com.google.j2kt.annotations.Throws")
+        != null) {
+      String suffix = methodExecutable.getParameters().isEmpty() ? "AndReturnError:" : "error:";
+      return nameTable.getMethodSelector(methodExecutable) + suffix;
+    }
     return null;
   }
 
@@ -130,12 +142,19 @@ public class ObjectiveCAdapterMethodAnnotation extends UnitTreeVisitor {
         return EnumSet.copyOf(adaptations);
       }
     }
+    if (ElementUtil.getQualifiedNamedAnnotation(
+            methodExecutable, "com.google.j2kt.annotations.Throws")
+        != null) {
+      return EnumSet.of(Adaptation.EXCEPTIONS_AS_ERRORS);
+    }
     return null;
   }
 
   private boolean isMethodAnnotatedForAdapter(ExecutableElement methodExecutable) {
     boolean methodIsAnnotated =
-        ElementUtil.hasAnnotation(methodExecutable, ObjectiveCAdapterMethod.class);
+        ElementUtil.hasAnnotation(methodExecutable, ObjectiveCAdapterMethod.class)
+            || ElementUtil.hasQualifiedNamedAnnotation(
+                methodExecutable, "com.google.j2kt.annotations.Throws");
     if (!methodIsAnnotated) {
       return false;
     }
@@ -149,9 +168,10 @@ public class ObjectiveCAdapterMethodAnnotation extends UnitTreeVisitor {
     long expectedArgCount = methodExecutable.getParameters().size();
     if (methodAdaptsExceptionsAsError(methodExecutable)) {
       if (expectedArgCount == 0) {
-        if (!selector.endsWith("WithError:")) {
+        if (!selector.endsWith("AndReturnError:")) {
           ErrorUtil.error(
-              "ObjectiveCAdapterMethod handling exceptions requires a \"WithError:\" selector.");
+              "ObjectiveCAdapterMethod handling exceptions requires a \"AndReturnError:\""
+                  + " selector.");
           return false;
         }
       } else {
@@ -238,7 +258,7 @@ public class ObjectiveCAdapterMethodAnnotation extends UnitTreeVisitor {
     adapterConfig.adapterMethodBody.addStatement(
         new NativeStatement("} @catch (NSException *e) {"));
     adapterConfig.adapterMethodBody.addStatement(
-        new NativeStatement("if (nativeError) { *nativeError = JREErrorFromException(e); }"));
+        new NativeStatement("if (error) { *error = JREErrorFromException(e); }"));
     adapterConfig.adapterMethodBody.addStatement(catchReturnStatement);
     adapterConfig.adapterMethodBody.addStatement(new NativeStatement("}"));
   }
@@ -273,7 +293,7 @@ public class ObjectiveCAdapterMethodAnnotation extends UnitTreeVisitor {
       adapterConfig.returnValueExpression = boolConditionExpression;
     } else {
       ErrorUtil.warning(
-          "ObjectiveCAdapterMethod native BOOL return type adaptation used on a method without a"
+          "ObjectiveCAdapterMethod native bool return type adaptation used on a method without a"
               + " boolean return.");
     }
   }
@@ -510,6 +530,13 @@ public class ObjectiveCAdapterMethodAnnotation extends UnitTreeVisitor {
     if (!isMethodAnnotatedForAdapter(methodExecutable)) {
       return;
     }
+    
+    // Check if the adapter method has already been added.
+    String adapterSelector = adapterSelectorForMethod(methodExecutable);
+    if (adapterMethodSelectors.contains(adapterSelector)) {
+      return;
+    }
+    adapterMethodSelectors.add(adapterSelector);
 
     List<VariableElement> configParameters = new ArrayList<>();
     List<Expression> configArguments = new ArrayList<>();
@@ -520,7 +547,7 @@ public class ObjectiveCAdapterMethodAnnotation extends UnitTreeVisitor {
     if (methodAdaptsExceptionsAsError(methodExecutable)) {
       GeneratedVariableElement errorParam =
           GeneratedVariableElement.newParameter(
-              "nativeError", new NativeType("NSError **", "JreExceptionAdapters.h"), null);
+              "error", new NativeType("NSError **", "JreExceptionAdapters.h"), null);
       configParameters.add(errorParam);
     }
 
@@ -558,7 +585,7 @@ public class ObjectiveCAdapterMethodAnnotation extends UnitTreeVisitor {
       adaptArrayReturns(adapterConfig);
     }
 
-    // Process exception wrapping last as it affects the postion of return statement in body.
+    // Process exception wrapping last as it affects the position of return statement in body.
     if (methodAdaptsExceptionsAsError(methodExecutable)) {
       adaptExceptionsAsErrors(adapterConfig);
     } else {
